@@ -58,6 +58,8 @@ if __name__ == "__main__":
 
     # 4. 恢复回原始时间
     try:
+
+
         set_system_time(original_time)
         restored_time = get_current_time()
         print("=" * 40)
