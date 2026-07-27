@@ -15,7 +15,7 @@ class Singleton(metaclass=SingletonMeta):
         self.value = value
 
 
-# 测试代码
+# 测试代码  
 if __name__ == "__main__":
     s1 = Singleton(100)
     s2 = Singleton(200)

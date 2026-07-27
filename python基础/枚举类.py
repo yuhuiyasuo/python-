@@ -1,4 +1,4 @@
-from enum import Enum
+from python基础.enum_test import Enum
 
 # 定义枚举类（继承 Enum）
 class Color(Enum):
