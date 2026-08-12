@@ -1,78 +1,105 @@
-import asyncio
-import logging
-from pymodbus.server import ModbusTcpServer
-from pymodbus.datastore import (
-    ModbusSequentialDataBlock,
-    ModbusSlaveContext,
-    ModbusServerContext
-)
+import socket
+import time
 
-# -------------------------- 日志配置 --------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S"
-)
-logging.getLogger("pymodbus").setLevel(logging.INFO)
-
-# 全局保存从站上下文，用于后台读取寄存器状态
-slave_ctx = None
+# ===================== 配置项 =====================
+CAMERA_IP = "169.254.50.50"
+CAMERA_PORT = 2001
+HANDSHAKE_REQ = "hello"  # 对应界面「交互请求文本」
+HANDSHAKE_ACK = "world"  # 对应界面「交互回复文本」
+TRIGGER_CMD = "start"  # 对应界面「触发文本」
+CMD_ENDING = "\r\n"  # 指令结束符，若无效可依次换成 "\n" 或 ""
+RECONNECT_DELAY = 3  # 重连间隔（秒）
+RECV_TIMEOUT = 5  # 接收超时时间（秒）
 
 
-# -------------------------- 寄存器快照打印 --------------------------
-async def print_register_snapshot():
-    """后台协程：每秒打印一次保持寄存器快照，直观展示写入的数据变化"""
-    print("\n📊 保持寄存器快照将每秒自动刷新\n")
+# =================================================
+
+def tcp_connect_and_handshake():
+    """建立TCP连接并完成握手，成功返回socket对象，失败返回None"""
+    client = None
+    try:
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(RECV_TIMEOUT)
+        print(f"[连接] 正在连接 {CAMERA_IP}:{CAMERA_PORT} ...")
+        client.connect((CAMERA_IP, CAMERA_PORT))
+        print("[连接] ✅ TCP连接建立成功")
+
+        # 1. 强制完成握手，不握手相机不会响应后续指令
+        handshake_msg = (HANDSHAKE_REQ + CMD_ENDING).encode("ascii")
+        client.sendall(handshake_msg)
+        print(f"[握手] 📤 已发送握手指令: {repr(handshake_msg)}")
+
+        reply = client.recv(1024).decode("ascii", errors="ignore").strip()
+        print(f"[握手] 📥 收到相机回复: {repr(reply)}")
+
+        if reply == HANDSHAKE_ACK:
+            print("[握手] ✅ 握手验证通过")
+            return client
+        else:
+            print("[握手] ❌ 握手回复不匹配，相机拒绝后续指令")
+            client.close()
+            return None
+
+    except Exception as e:
+        print(f"[连接] ❌ 连接/握手失败: {e}")
+        if client:
+            try:
+                client.close()
+            except:
+                pass
+        return None
+
+
+def continuous_scan():
+    client_socket = None
     while True:
-        if slave_ctx:
-            # 读取 地址0~59 的保持寄存器值
-            hr_values = slave_ctx.store['h'].getValues(0, count=60)
-            print("=" * 85)
-            print(f"地址 00-19: {hr_values[0:20]}")
-            print(f"地址 20-39: {hr_values[20:40]}")
-            print(f"地址 40-59: {hr_values[40:60]}")
-            print("=" * 85)
-        await asyncio.sleep(1)
+        # 连接断开时，重新建立连接+握手
+        if client_socket is None:
+            client_socket = tcp_connect_and_handshake()
+            if client_socket is None:
+                print(f"⏳ {RECONNECT_DELAY}秒后尝试重连...\n")
+                time.sleep(RECONNECT_DELAY)
+                continue
 
+            # 握手成功后，发送持续触发指令
+            try:
+                trigger_msg = (TRIGGER_CMD + CMD_ENDING).encode("ascii")
+                client_socket.sendall(trigger_msg)
+                print(f"[触发] 📤 已发送持续触发指令: {repr(trigger_msg)}")
+                print("[触发] ▶️  相机已进入持续扫码模式，等待条码...\n")
+            except Exception as e:
+                print(f"[触发] ❌ 发送触发指令失败: {e}")
+                client_socket.close()
+                client_socket = None
+                continue
 
-# -------------------------- 服务端主逻辑 --------------------------
-async def run_modbus_server():
-    global slave_ctx
+        # 循环接收扫码结果
+        try:
+            data = client_socket.recv(2048)
+            # 空数据 = 连接已被相机主动断开
+            if not data:
+                print("[连接] ⚠️  相机主动断开了连接")
+                client_socket.close()
+                client_socket = None
+                continue
 
-    # 1. 初始化4种标准Modbus存储区，各100个地址，初始值全为0
-    slave_ctx = ModbusSlaveContext(
-        hr=ModbusSequentialDataBlock(0, [0] * 100),  # 保持寄存器 → 功能码 03读 / 16写
-        co=ModbusSequentialDataBlock(0, [0] * 100),  # 线圈 → 功能码 01读 / 15写
-        di=ModbusSequentialDataBlock(0, [0] * 100),  # 离散输入 → 功能码 02读
-        ir=ModbusSequentialDataBlock(0, [0] * 100),  # 输入寄存器 → 功能码 04读
-        unit=0  # 从站地址，和客户端测试代码保持一致
-    )
+            scan_result = data.decode("utf-8", errors="ignore").strip()
+            if scan_result:
+                print(f"[扫码] 📷 结果：{scan_result}")
 
-    # 2. 创建服务端全局上下文
-    server_context = ModbusServerContext(slaves=slave_ctx, single=True)
-
-    # 3. 启动后台快照打印协程
-    asyncio.create_task(print_register_snapshot())
-
-    # 4. 启动TCP服务端
-    server = ModbusTcpServer(
-        context=server_context,
-        address=("0.0.0.0", 502)
-    )
-
-    print("✅ Modbus TCP 模拟服务端启动成功")
-    print("📍 监听端口: 502    从站地址: 0")
-    print("💡 运行客户端测试脚本后，观察下方寄存器数值变化即可验证写入效果\n")
-
-    await server.serve_forever()
+        except socket.timeout:
+            # 接收超时是正常的，说明暂无条码，继续等待
+            continue
+        except Exception as e:
+            print(f"[接收] ❌ 异常：{e}")
+            client_socket.close()
+            client_socket = None
+            print(f"⏳ {RECONNECT_DELAY}秒后自动重连...\n")
+            time.sleep(RECONNECT_DELAY)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_modbus_server())
-    except PermissionError:
-        print("\n❌ 权限错误：Windows系统502端口需要管理员权限")
-        print("解决方案：以管理员身份运行终端，或把端口改为 5020（同步修改客户端port参数）")
-    except OSError as e:
-        print(f"\n❌ 启动失败: {e}")
-        print("大概率是端口被占用，请更换端口号")
+        continuous_scan()
+    except KeyboardInterrupt:
+        print("\n🚫 程序已手动停止")

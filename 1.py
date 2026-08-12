@@ -1,96 +1,131 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import socket
+import time
 
-"""
-Modbus TCP 客户端写入测试
-支持功能：写单个寄存器、写多个寄存器、写单个线圈、写多个线圈
-通过回读验证写入结果
-"""
-
-from pymodbus.client import ModbusTcpClient
-import logging
-
-# 启用日志便于调试（可选）
-logging.basicConfig()
-log = logging.getLogger()
-log.setLevel(logging.INFO)   # 改为 DEBUG 可查看更多细节
-
-
-def modbus_write_test(host="127.0.0.1", port=502, slave_id=1):
-
-    client = ModbusTcpClient(host, port)
-
-    if not client.connect():
-        print("❌ 无法连接到 Modbus 服务器，请检查 IP 和端口")
-        return
-
-    print(f"✅ 已连接到 {host}:{port}，从站 ID = {slave_id}\n")
-
+def send_trigger(host, trigger_port=2001, trigger_cmd=b"START\r\n"):
+    """向读码器触发端口发送启动指令"""
     try:
-        # ---------- 1. 写单个寄存器 (Holding Register) ----------
-        reg_addr = 0
-        reg_value = 1234
-        print(f"[测试1] 写单个寄存器 地址={reg_addr} 值={reg_value}")
-        result = client.write_register(reg_addr, reg_value, slave=slave_id)
-        if result.isError():
-            print(f"   ❌ 写入失败: {result}")
-        else:
-            # 回读验证
-            read = client.read_holding_registers(reg_addr, 1, slave=slave_id)
-            if not read.isError():
-                print(f"   ✅ 回读成功: {read.registers[0]}")
-            else:
-                print(f"   ❌ 回读失败: {read}")
-
-        # ---------- 2. 写多个寄存器 ----------
-        reg_addr2 = 10
-        reg_values = [11, 22, 33]
-        print(f"\n[测试2] 写多个寄存器 地址={reg_addr2} 值={reg_values}")
-        result = client.write_registers(reg_addr2, reg_values, slave=slave_id)
-        if result.isError():
-            print(f"   ❌ 写入失败: {result}")
-        else:
-            read = client.read_holding_registers(reg_addr2, len(reg_values), slave=slave_id)
-            if not read.isError():
-                print(f"   ✅ 回读成功: {read.registers}")
-            else:
-                print(f"   ❌ 回读失败: {read}")
-
-        # ---------- 3. 写单个线圈 (Coil) ----------
-        coil_addr = 0
-        coil_value = True
-        print(f"\n[测试3] 写单个线圈 地址={coil_addr} 值={coil_value}")
-        result = client.write_coil(coil_addr, coil_value, slave=slave_id)
-        if result.isError():
-            print(f"   ❌ 写入失败: {result}")
-        else:
-            read = client.read_coils(coil_addr, 1, slave=slave_id)
-            if not read.isError():
-                print(f"   ✅ 回读成功: {read.bits[0]}")
-            else:
-                print(f"   ❌ 回读失败: {read}")
-
-        # ---------- 4. 写多个线圈 ----------
-        coil_addr2 = 5
-        coil_values = [True, False, True]
-        print(f"\n[测试4] 写多个线圈 地址={coil_addr2} 值={coil_values}")
-        result = client.write_coils(coil_addr2, coil_values, slave=slave_id)
-        if result.isError():
-            print(f"   ❌ 写入失败: {result}")
-        else:
-            read = client.read_coils(coil_addr2, len(coil_values), slave=slave_id)
-            if not read.isError():
-                print(f"   ✅ 回读成功: {read.bits}")
-            else:
-                print(f"   ❌ 回读失败: {read}")
-
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(5)
+            sock.connect((host, trigger_port))
+            sock.send(trigger_cmd)
+            print(f"已向 {host}:{trigger_port} 发送触发指令")
+            return True
     except Exception as e:
-        print(f"\n⚠️ 发生异常: {e}")
-    finally:
-        client.close()
-        print("\n🔌 连接已关闭")
+        print(f"触发失败: {e}")
+        return False
+
+def read_code(host, port, timeout=30):
+    """连接读码器数据端口，等待并读取条码内容"""
+    data = bytearray()
+    deadline = time.time() + float(timeout)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        sock.connect((host, int(port)))
+        print(f"已连接到数据端口 {host}:{port}")
+
+        while time.time() < deadline:
+            try:
+                chunk = sock.recv(1024)
+            except socket.timeout:
+                if data:
+                    # 已有部分数据，继续等待结束符
+                    continue
+                else:
+                    continue
+
+            if not chunk:
+                break
+
+            data.extend(chunk)
+
+            # 海康输出格式以分号、回车或换行结束
+            if b";" in data or b"\r" in data or b"\n" in data:
+                break
+
+    code = data.decode("utf-8", errors="ignore").strip()
+    code = code.strip(";\r\n ")
+    print(f"收到扫码结果: {code}")
+    return code
+
+def start_main(params_dict):
+    """
+    主控函数，参数顺序（按原变量列表）：
+        variables[0] -> IP地址
+        variables[1] -> 数据端口（如9003）
+        variables[2] -> 发送数据（旧配置，现忽略）
+        variables[3] -> 变量ID（用于写入结果）
+        variables[5] -> 超时时间（可选）
+    """
+    variables = params_dict.get("variables", [])
+    if len(variables) < 4:
+        raise ValueError("参数不足，需要至少 IP、端口、发送数据占位、变量ID")
+
+    ip = variables[0]["value"]
+    data_port = int(variables[1]["value"])
+    variable_id = variables[3]["value"]
+    timeout = int(variables[5]["value"]) if len(variables) > 5 else 30
+
+    # ---- 循环重试配置 ----
+    MAX_RETRIES = 30          # 最大重试次数，可根据需要调整
+    RETRY_DELAY = 0.5         # 重试前等待时间（秒）
+    TRIGGER_PORT = 2001
+    TRIGGER_CMD = b"START\r\n"
+
+    retry_count = 0
+    code = None
+
+    while retry_count < MAX_RETRIES:
+        retry_count += 1
+        print(f"\n===== 第 {retry_count} 次尝试 =====")
+
+        # ---- 1. 触发扫码 ----
+        if not send_trigger(ip, TRIGGER_PORT, TRIGGER_CMD):
+            print("触发失败，等待后重试...")
+            time.sleep(RETRY_DELAY)
+            continue
+
+        # 等待设备响应（可适当延时）
+        time.sleep(0.5)
+
+        # ---- 2. 读取扫码结果 ----
+        try:
+            code = read_code(ip, data_port, timeout)
+        except Exception as e:
+            print(f"读取过程发生异常: {e}，将重试...")
+            time.sleep(RETRY_DELAY)
+            continue
+
+        # ---- 3. 判断是否成功 ----
+        if code:
+            print(f"扫码成功！结果: {code}")
+            break
+        else:
+            print("未收到有效扫码结果，准备重试...")
+            time.sleep(RETRY_DELAY)
+            continue
+
+    # 若循环结束仍未成功
+    if not code:
+        raise TimeoutError(f"超过最大重试次数 ({MAX_RETRIES})，扫码失败")
+
+    # ---- 4. 写入变量 ----
+    # variable_write_throw_exception(variable_id, code)
+    print(f"扫码结果已写入变量 {variable_id}")
+
+    return params_dict
 
 
 if __name__ == "__main__":
-    # 使用默认参数连接本地模拟服务器，可根据实际修改
-    modbus_write_test()
+    # 测试示例
+    HOST = "169.254.50.50"
+    DATA_PORT = 9003
+    test_params = {
+        "variables": [
+            {"value": HOST},
+            {"value": DATA_PORT},
+            {"value": ""},          # 占位
+            {"value": "target_var"} # variable_id
+        ]
+    }
+    start_main(test_params)

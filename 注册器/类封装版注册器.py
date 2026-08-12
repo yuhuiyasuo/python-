@@ -32,6 +32,8 @@ class AliPay:
     def pay(self, amount):
         print(f"支付宝支付 {amount} 元")
 
+print(payment_registry.list_all())
+
 #等价于
 # # 第一步：先执行 register("alipay")，得到 wrapper 函数
 # wrapper_func = payment_registry.register("alipay")
